@@ -1,0 +1,612 @@
+---
+title: "Methods"
+output: html_document
+date: "2024-07-09"
+---
+
+# Pre proccesing
+```{r, echo=FALSE}
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(tidymodels)
+library(broom)
+
+# Load the dataset
+data <- read_csv('cleaned_smmh.csv')
+
+# Filter out retired individuals because there are not many of them
+data <- data %>% filter(occ_status != "Retired")
+
+# Filter the data to include only Male and Female genders
+data <- data %>% filter(gender %in% c("Male", "Female"))
+
+# Convert avg_time_on_sm to numeric
+data <- data %>%
+  mutate(avg_time_on_sm = case_when(
+    avg_time_on_sm == "Less than an Hour" ~ 0,
+    avg_time_on_sm == "Between 1 and 2 hours" ~ 1,
+    avg_time_on_sm == "Between 2 and 3 hours" ~ 2,
+    avg_time_on_sm == "Between 3 and 4 hours" ~ 3,
+    avg_time_on_sm == "Between 4 and 5 hours" ~ 4,
+    avg_time_on_sm == "More than 5 hours" ~ 5
+  ))
+
+# Define custom labels for the subgraphs
+illness_labels <- c(
+  adhd_score = "ADHD Score",
+  depression_score = "Depression Score",
+  self_esteem_score = "Self-Esteem Score",
+  anxiety_score = "Anxiety Score"
+)
+
+unique_values <- unique(data$gender)
+print(unique_values)
+```
+
+# Dividing data into treatment and control gropus because the data is observational
+```{r}
+# Using Propensity Score Matching (PSM) to reduce selection bias when evaluating the time spent on social media on mental health scores. PSM is used for later inference on causation between the variables
+
+# Create a binary indicator for social media usage (more than 2 hours)
+data <- data %>%
+  mutate(sm_usage = ifelse(avg_time_on_sm > 2, 1, 0))
+
+# Split the data into training and testing sets
+set.seed(123)
+data_split <- initial_split(data, prop = 0.8, strata = sm_usage)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+# Convert sm_usage to factor in your dataset
+train_data <- train_data %>%
+  mutate(sm_usage = factor(sm_usage))
+
+# Create a recipe for the propensity score model
+ps_recipe <- recipe(sm_usage ~ overall_mental_health_score + occ_status, data = train_data) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_predictors())
+
+# Specify the logistic regression model for propensity scores
+ps_model <- logistic_reg() %>%
+  set_engine("glm")
+
+# Create a workflow for the propensity score model
+ps_workflow <- workflow() %>%
+  add_recipe(ps_recipe) %>%
+  add_model(ps_model)
+
+# Fit the propensity score model
+ps_fit <- fit(ps_workflow, data = train_data)
+
+# Predict propensity scores
+train_data <- train_data %>%
+  bind_cols(predict(ps_fit, new_data = train_data, type = "prob") %>% rename(propensity_score = .pred_1))
+
+# Calculate the desired sample size for each group
+sample_size <- min(table(train_data$sm_usage))
+
+# Adjust the sampling size to min(table(sm_usage)) (the minimum between size of treatment group and size of control group)
+train_data <- train_data %>%
+  group_by(sm_usage) %>%
+  sample_n(size = min(table(train_data$sm_usage))) %>%
+  ungroup()
+```
+
+# Introduction on what are the possible relationships between different variables and mental health scores
+
+##### Possible correlation between age and mental health
+```{r}
+# Create age groups in 5-year intervals from 15 to 60
+data$age_group <- cut(data$age, breaks = seq(10, 60, by = 10), right = FALSE)
+
+# Remove rows where age_group is NA
+data <- data[!is.na(data$age_group), ]
+
+# Create a box plot
+ggplot(data, aes(x = age_group, y = overall_mental_health_score)) +
+  geom_boxplot(fill = "#9B59B6", color = "black") +
+    geom_jitter() +
+  labs(x = "Age Group", y = "Overall Mental Health Score",
+       title = "Distribution of Mental Health Scores by Age Group (5-Year Intervals)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x-axis labels if needed
+```
+##### University students comapared to salaried workers and school students
+```{r}
+# Create a new column for count of people
+temp_data <- data %>%
+  group_by(occ_status, avg_time_on_sm) %>%
+  summarise(count = n())
+
+temp_data$count <- as.integer(temp_data$count)
+
+plot <- ggplot(temp_data, aes(x = avg_time_on_sm, y = count, fill = occ_status)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(aes(label = ifelse(count > 0, "", "")), position = position_stack(vjust = 0.5)) +  # Adjusted to show no labels
+  facet_wrap(~ occ_status, scales = "fixed") +
+  scale_fill_manual(values = custom_colors, name = "Occupation Status") +  # Use custom colors
+    scale_x_continuous(breaks = 0:5) +  # Set x-axis breaks
+  labs(title = "Count of People by Average Time on Social Media and Occupation Status",
+       x = "Average Time on Social Media",
+       y = "Count of People") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1))
+
+# Display the plot
+print(plot)
+```
+
+```{r}
+# Select specific columns for plotting
+data_selected <- data %>%
+  select(occ_status, adhd_score, depression_score, anxiety_score, self_esteem_score)
+
+# Reshape data for plotting
+data_long <- data_selected %>%
+  pivot_longer(cols = ends_with("score"),
+               names_to = "mental_health_condition", 
+               values_to = "score")
+
+# Plot grouped boxplot with facets
+ggplot(data_long, aes(x = occ_status, y = score, fill = occ_status)) +
+  geom_boxplot(outlier.shape = NA) +  # Remove outliers
+  facet_wrap(~ mental_health_condition, scales = "free_y", ncol = 2, labeller = as_labeller(illness_labels)) +
+  scale_fill_manual(values = custom_colors) +  # Use custom colors
+  labs(title = "Distribution of Illness Scores by Occupation Status",
+       x = "Occupation Status",
+       y = "Score",
+       fill = "Occupation Status") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels for better readability
+    strip.text = element_text(size = 10, face = "bold")  # Customize facet strip text
+  )
+```
+
+# Checking interaction effects between the different occupational groups
+Main effects - Assuming relationship between average time on social media and mental health score does not vary by the occupational groups.
+Interaction effect - Assuming relationship between average time on social media and mental health score varies by the occupational groups.
+#### Main effects model
+```{r}
+# Fit model
+main_effect_model <- lm(overall_mental_health_score ~ avg_time_on_sm + occ_status, data = data)
+
+if (!is.factor(data$occ_status)) {
+  data$occ_status <- factor(data$occ_status, levels = c("University Student", "School Student", "Salaried Worker"))
+}
+
+# Define levels explicitly for avg_time_on_sm and occ_status
+avg_time_levels <- levels(data$avg_time_on_sm)
+occ_status_levels <- levels(data$occ_status)
+
+# Generate data for plotting
+plot_data <- expand.grid(avg_time_on_sm = unique(data$avg_time_on_sm),
+                         occ_status = levels(data$occ_status))
+
+# Predict using the model
+plot_data$predicted_score <- predict(main_effect_model, newdata = plot_data)
+
+# Plotting with ggplot2
+ggplot(plot_data, aes(x = factor(avg_time_on_sm), y = predicted_score, color = occ_status, group = occ_status)) +
+  geom_line() +
+  labs(title = "Main Effects",
+    x = "Average Time on Social Media", y = "Predicted Mental Health Score") +
+  scale_color_manual(values = c("blue", "green", "red"), name = "Occupation Status") +
+  theme_minimal()
+```
+Same slope: Rate of change in mental health score as the average time of use increases does not vary between paintings by the occupational groups.
+Different intercept: University students have consistently more score than the other occupational groups.
+#### Interaction effect model
+```{r}
+# Fit your model (replace with your actual model fitting code)
+intercation_effects_model <- lm(overall_mental_health_score ~ avg_time_on_sm * occ_status, data = data)
+
+if (!is.factor(data$occ_status)) {
+  data$occ_status <- factor(data$occ_status, levels = c("University Student", "School Student", "Salaried Worker"))
+}
+
+# Define levels explicitly for avg_time_on_sm and occ_status
+avg_time_levels <- levels(data$avg_time_on_sm)
+occ_status_levels <- levels(data$occ_status)
+
+# Generate data for plotting
+plot_data <- expand.grid(avg_time_on_sm = unique(data$avg_time_on_sm),
+                         occ_status = levels(data$occ_status))
+
+# Predict using the model
+plot_data$predicted_score <- predict(intercation_effects_model, newdata = plot_data)
+
+# Plotting with ggplot2
+ggplot(plot_data, aes(x = avg_time_on_sm, y = predicted_score, color = occ_status, group = occ_status)) +
+  geom_line() +
+  labs(title = "Interaction Effects",
+    x = "Average Time on Social Media", y = "Predicted Score") +
+  scale_color_manual(values = c("blue", "green", "red"), name = "Occupation Status") +
+  theme_minimal()
+```
+#### Checking which model is better
+```{r}
+glance(main_effects_model)$adj.r.squared
+glance(intercation_effects_model)$adj.r.squared
+```
+#### Conclusion: By assuming that relationship between average time on social media and mental health score varies by the occupational groups we get a slightly more accurate model. Therefore, we will anaylze each occupational group seperatly.
+
+
+# Univesity students
+```{r}
+# Filter data for university students
+university_data <- data %>%
+  filter(occ_status == "University Student")
+
+# Fit the linear regression model
+model_university <- lm(overall_mental_health_score ~ avg_time_on_sm + age + rel_status + gender + private_affiliated + not_affiliated + school_affiliated + 
+              company_affiliated + government_affiliated + 
+              uses_facebook + uses_twitter + uses_instagram + uses_youtube + 
+              uses_discord + uses_reddit + uses_pinterest + uses_tiktok + 
+              uses_snapchat, data = university_data)
+
+# Summarize the model
+summary(model_university)
+```
+
+```{r}
+# For university students, explore the relationship between average time on social media and overall mental health score between users and non-users fo tiktok
+
+# Fit the linear regression model
+model_university <- lm(overall_mental_health_score ~ avg_time_on_sm+ uses_tiktok + age, data = university_data)
+
+# Summarize the model
+summary(model_university)
+```
+
+```{r}
+# Predict on test data
+test_university_data <- data %>%
+  filter(occ_status == "University Student")
+
+test_university_data <- test_university_data %>%
+  mutate(predictions = predict(model_university, newdata = .))
+
+# Calculate performance metrics on test data
+rmse_university <- yardstick::rmse_vec(test_university_data$overall_mental_health_score, test_university_data$predictions)
+r_squared_university <- yardstick::rsq_vec(test_university_data$overall_mental_health_score, test_university_data$predictions)
+
+cat("University Students Model Performance:\n")
+cat("RMSE:", rmse_university, "\n")
+cat("R-squared:", r_squared_university, "\n")
+
+# Get confidence intervals
+conf_intervals <- confint(model_university)
+
+# Combine results into a tidy data frame
+model_tidy <- tidy(model_university) %>%
+  mutate(
+    conf.low = conf_intervals[, 1],
+    conf.high = conf_intervals[, 2]
+  )
+
+# Calculate the Margin of Error
+model_tidy <- model_tidy %>%
+  mutate(margin_of_error = (conf.high - conf.low) / 2)
+
+# Summarize and Display the Results
+model_tidy %>%
+  select(term, estimate, std.error, margin_of_error, conf.low, conf.high) %>%
+  arrange(desc(abs(estimate))) %>%
+  print()
+```
+
+```{r}
+# Check linearity
+ht_wt_fit_aug <- augment(model_university)
+
+# Residuals vs Fitted plot for the extended model (Check homoscedasticity)
+ggplot(model_university, aes(.fitted, .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals vs Fitted Values for University Students",
+       x = "Fitted Values",
+       y = "Residuals")
+
+# Normal Q-Q plot for the extended model (Check normality)
+qqnorm(lm_model_extended$residuals)
+qqline(lm_model_extended$residuals, col = "red")
+title(main = "\nfor University Students", line = 0.8)
+
+```
+
+```{r}
+# Results plot
+# Filter data for the relevant occupation statuses
+filtered_data <- data %>%
+  filter(occ_status %in% c("University Student"))
+
+# Convert 'uses_tiktok' to a factor
+filtered_data <- filtered_data %>%
+  mutate(uses_tiktok = as.factor(uses_tiktok))
+
+# Reshape the data to long format for illness scores
+long_data_illness <- filtered_data %>%
+  select(occ_status, uses_tiktok, adhd_score, depression_score, self_esteem_score, anxiety_score) %>%
+  pivot_longer(
+    cols = c(adhd_score, depression_score, self_esteem_score, anxiety_score),
+    names_to = "illness",
+    values_to = "score"
+  )
+
+# Create the plot with facet_grid for horizontal arrangement
+ggplot(long_data_illness, aes(x = illness, y = score, fill = uses_tiktok)) +
+  geom_boxplot(position = position_dodge(width = 0.8)) +
+  facet_grid(occ_status ~ ., scales = "free_x") +
+  labs(
+    title = "Illness Scores by TikTok Usage and Occupation Status",
+    x = "Illness",
+    y = "Score",
+    fill = "Uses TikTok"
+  ) +
+    scale_x_discrete(labels = c(
+    adhd_score = "ADHD Score",
+    depression_score = "Depression Score",
+    self_esteem_score = "Self-esteem Score",
+    anxiety_score = "Anxiety Score"
+  )) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    strip.text = element_text(size = 12, face = "bold")
+  )
+```
+
+# Salaried Workers
+```{r}
+### Model for salaried workers
+# Filter data for salaried workers
+workers_data <- data %>%
+  filter(occ_status == "Salaried Worker")
+
+# Fit the linear regression model
+model_workers <- lm(overall_mental_health_score ~ avg_time_on_sm + age + rel_status + gender + private_affiliated + not_affiliated + school_affiliated + 
+              company_affiliated + government_affiliated + 
+              uses_facebook + uses_twitter + uses_instagram + uses_youtube + 
+              uses_discord + uses_reddit + uses_pinterest + uses_tiktok + 
+              uses_snapchat, data = workers_data)
+
+# Summarize the model
+summary(model_workers)
+```
+
+```{r}
+# Fit the linear regression model
+model_worker <- lm(overall_mental_health_score ~ avg_time_on_sm  + uses_instagram + uses_pinterest + school_affiliated + uses_facebook, data = worker_data)
+
+# Summarize the model
+summary(model_worker)
+```
+
+```{r}
+# Predict on test data
+test_worker_data <- data %>%
+  filter(occ_status == "Salaried Worker")
+
+# Predict on test data for Salaried Workers
+test_worker_data <- test_worker_data %>%
+  mutate(predictions = predict(model_worker, newdata = .))
+
+# Calculate performance metrics on test data
+rmse_worker <- yardstick::rmse_vec(test_worker_data$overall_mental_health_score, test_worker_data$predictions)
+r_squared_worker <- yardstick::rsq_vec(test_worker_data$overall_mental_health_score, test_worker_data$predictions)
+
+cat("Salaried Workers Model Performance:\n")
+cat("RMSE:", rmse_worker, "\n")
+cat("R-squared:", r_squared_worker, "\n")
+
+# Get confidence intervals
+conf_intervals <- confint(model_worker)
+
+# Combine results into a tidy data frame
+model_tidy <- tidy(model_worker) %>%
+  mutate(
+    conf.low = conf_intervals[, 1],
+    conf.high = conf_intervals[, 2]
+  )
+
+# Calculate the Margin of Error
+model_tidy <- model_tidy %>%
+  mutate(margin_of_error = (conf.high - conf.low) / 2)
+
+# Summarize and Display the Results
+model_tidy %>%
+  select(term, estimate, std.error, margin_of_error, conf.low, conf.high) %>%
+  arrange(desc(abs(estimate))) %>%
+  print()
+```
+
+```{r}
+# Check linearity
+ht_wt_fit_aug <- augment(model_work)
+
+# Residuals vs Fitted plot for the extended model (Check homoscedasticity)
+ggplot(model_work, aes(.fitted, .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals vs Fitted Values for Salaried Workers",
+       x = "Fitted Values",
+       y = "Residuals")
+
+# Normal Q-Q plot for the extended model (Check normality)
+qqnorm(lm_model_extended$residuals)
+qqline(lm_model_extended$residuals, col = "red")
+title(main = "\nfor Salaried Workers", line = 0.8)
+
+```
+
+```{r}
+# Filter data for the relevant occupation statuses
+filtered_data <- data %>%
+  filter(occ_status %in% c("Salaried Worker"))
+
+# Convert 'avg_time_on_sm' to a factor
+filtered_data <- filtered_data %>%
+  mutate(avg_time_on_sm = as.factor(avg_time_on_sm))
+
+# Reshape the data to long format for illness scores
+long_data_illness <- filtered_data %>%
+  select(occ_status, avg_time_on_sm, adhd_score, depression_score, self_esteem_score, anxiety_score) %>%
+  pivot_longer(
+    cols = c(adhd_score, depression_score, self_esteem_score, anxiety_score),
+    names_to = "illness",
+    values_to = "score"
+  )
+
+# Create the plot with facet_wrap for horizontal arrangement
+ggplot(long_data_illness, aes(x = avg_time_on_sm, y = score, fill = avg_time_on_sm)) +
+  geom_boxplot(position = position_dodge(width = 0.8)) +
+  facet_wrap(~ illness, scales = "free_y", labeller = as_labeller(illness_labels)) +
+  labs(
+    title = "Mental Health Scores by Average Time on Social Media for Salaried Workers",
+    x = "Average Time on Social Media",
+    y = "Score",
+    fill = "Average Time on Social Media"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    plot.title = element_text(size = 13.8, face = "bold", margin = margin(t = 10, b = 10), hjust = 0.75),  # Adjust the title margin
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    strip.text = element_text(size = 12, face = "bold")  )
+```
+
+# School students
+```{r}
+### Model for school student
+# Filter data for university students
+school_data <- train_data %>%
+  filter(occ_status == "School Student")
+
+# Fit the linear regression model
+model_school <- lm(overall_mental_health_score ~ avg_time_on_sm + age + rel_status + gender + private_affiliated + not_affiliated + school_affiliated + 
+              company_affiliated + government_affiliated + 
+              uses_facebook + uses_twitter + uses_instagram + uses_youtube + 
+              uses_discord + uses_reddit + uses_pinterest + uses_tiktok + 
+              uses_snapchat, data = school_data)
+
+# Summarize the model
+summary(model_school)
+```
+
+```{r}
+# Fit the linear regression model
+model_school <- lm(overall_mental_health_score ~ company_affiliated + uses_facebook + avg_time_on_sm,  data = school_data)
+
+# Summarize the model
+summary(model_school)
+```
+
+```{r}
+# Predict on test data
+test_school_data <- data %>%
+  filter(occ_status == "School Student")
+
+# Predict on test data for Salaried Workers
+test_school_data <- test_school_data %>%
+  mutate(predictions = predict(model_worker, newdata = .))
+
+# Calculate performance metrics on test data
+rmse_school <- yardstick::rmse_vec(test_school_data$overall_mental_health_score, test_school_data$predictions)
+r_squared_school <- yardstick::rsq_vec(test_school_data$overall_mental_health_score, test_school_data$predictions)
+
+cat("School Students Model Performance:\n")
+cat("RMSE:", rmse_school, "\n")
+cat("R-squared:", r_squared_school, "\n")
+
+# Get confidence intervals
+conf_intervals <- confint(model_school)
+
+# Combine results into a tidy data frame
+model_tidy <- tidy(model_school) %>%
+  mutate(
+    conf.low = conf_intervals[, 1],
+    conf.high = conf_intervals[, 2]
+  )
+
+# Calculate the Margin of Error
+model_tidy <- model_tidy %>%
+  mutate(margin_of_error = (conf.high - conf.low) / 2)
+
+# Summarize and Display the Results
+model_tidy %>%
+  select(term, estimate, std.error, margin_of_error, conf.low, conf.high) %>%
+  arrange(desc(abs(estimate))) %>%
+  print()
+```
+
+```{r}
+# Check linearity
+ht_wt_fit_aug <- augment(model_school)
+
+# Residuals vs Fitted plot for the extended model (Check homoscedasticity)
+ggplot(model_school, aes(.fitted, .resid)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals vs Fitted Values for School Students",
+       x = "Fitted Values",
+       y = "Residuals")
+
+# Normal Q-Q plot for the extended model (Check normality)
+qqnorm(lm_model_extended$residuals)
+qqline(lm_model_extended$residuals, col = "red")
+title(main = "\nfor School Students", line = 0.8)
+```
+
+```{r}
+# Filter data for school students
+school_data <- data %>%
+  filter(occ_status == "School Student")
+
+# Convert 'uses_facebook' to a factor
+school_data <- school_data %>%
+  mutate(uses_facebook = as.factor(uses_facebook))
+
+# Reshape the data to long format for illness scores
+long_data_illness <- school_data %>%
+  select(occ_status, uses_facebook, adhd_score, depression_score, self_esteem_score, anxiety_score) %>%
+  pivot_longer(
+    cols = c(adhd_score, depression_score, self_esteem_score, anxiety_score),
+    names_to = "illness",
+    values_to = "score"
+  )
+
+# Create the plot with facet_grid for horizontal arrangement
+ggplot(long_data_illness, aes(x = illness, y = score, fill = uses_facebook)) +
+  geom_boxplot(position = position_dodge(width = 0.8)) +
+  facet_grid(occ_status ~ ., scales = "free_x") +
+  labs(
+    title = "Illness Scores by Facebook Usage and Occupation Status",
+    x = "Illness",
+    y = "Score",
+    fill = "Uses Facebook"
+  ) +
+    scale_x_discrete(labels = c(
+    adhd_score = "ADHD Score",
+    depression_score = "Depression Score",
+    self_esteem_score = "Self-esteem Score",
+    anxiety_score = "Anxiety Score"
+  )) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    plot.title = element_text(size = 14, face = "bold"),
+    axis.title.x = element_text(size = 12),
+    axis.title.y = element_text(size = 12),
+    strip.text = element_text(size = 12, face = "bold")
+  )
+```
