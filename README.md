@@ -1,5 +1,5 @@
 # SISE2601 Project data description
-================
+
 Team no. 17
 
 ## Dataset: Social Media Mental Health Survey (SMMH)
