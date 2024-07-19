@@ -1,6 +1,6 @@
 # SISE2601 Project data description
 ================
-Team no. 17 - Emily Bellov, Shahar Ben Eliezer, Violetta Suhorukov, Gil Alfi
+Team no. 17
 
 ## Dataset: Social Media Mental Health Survey (SMMH)
 
